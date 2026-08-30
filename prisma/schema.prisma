@@ -1,0 +1,478 @@
+// ============================================================================
+// 🗺️ SCHÉMA DE DONNÉES — TRUSTVERIFY (KYC B2B MULTI-TENANT)
+// ============================================================================
+// Vue d'ensemble de l'architecture : `Company` est la racine du multi-tenant —
+// PRESQUE tous les autres modèles portent un `companyId` pour garantir que les
+// données d'une entreprise cliente ne sont jamais visibles par une autre
+// (le cloisonnement est appliqué au niveau applicatif via lib/rbac.ts, pas par
+// des policies Postgres — chaque requête Prisma doit filtrer par companyId).
+//
+// Convention de suppression en cascade utilisée dans ce schéma :
+// - onDelete: Cascade → l'enfant n'a aucun sens sans son parent (ex: un dossier
+//   KYC sans entreprise), donc il est supprimé avec elle.
+// - onDelete: SetNull → l'enfant doit SURVIVRE à la suppression du parent pour
+//   des raisons légales/traçabilité (ex: un AuditLog ou un dossier KYC doit
+//   rester consultable même si l'agent qui l'a traité quitte l'entreprise).
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =====================================================================
+// 🏢 PHASE 1 : LE VRAI MODÈLE B2B (MULTI-TENANT)
+// =====================================================================
+model Company {
+  id                   String                @id @default(cuid())
+  name                 String
+  plan                 String                @default("trial") // trial, starter, growth, enterprise
+  createdAt            DateTime              @default(now())
+
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean               @default(false)
+
+  // 💳 LIEN VERS STRIPE
+  // Sans ces deux identifiants, l'annulation ne pouvait exister QUE dans notre
+  // base : on posait `cancelAtPeriodEnd = true` sans jamais prévenir Stripe,
+  // qui continuait donc à facturer le client — et surtout, il devenait
+  // impossible de "reprendre" l'abonnement puisqu'on n'avait aucune référence
+  // à l'objet Subscription à réactiver. Ces champs sont nullables car les
+  // entreprises créées avant cette évolution (ou passées en plan payant
+  // manuellement) n'en ont pas : le code doit toujours prévoir un repli
+  // "DB seule" quand ils sont absents.
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+
+  users                User[]
+  verificationRequests VerificationRequest[]
+  auditLogs            AuditLog[]            
+  
+  // L'écosystème Développeur
+  apiKeys              ApiKey[]
+
+  // Les notifications de l'entreprise
+  notifications        Notification[]
+}
+
+// =====================================================================
+// 🧑‍💻 UTILISATEURS ET IAM (IDENTITY & ACCESS MANAGEMENT)
+// =====================================================================
+model User {
+  id                   String                @id @default(cuid())
+  fullName             String
+  companyName          String?               
+  
+  // 🏢 RELATION ENTREPRISE
+  companyId            String?
+  company              Company?              @relation(fields: [companyId], references: [id])
+  
+  // 🛡️ SÉCURITÉ & RÔLES
+  role                 String                @default("AGENT") 
+  
+  email                String                @unique
+  password             String?
+  avatarUrl            String?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt 
+  
+  // 🔐 WEBAUTHN / PASSKEYS
+  currentChallenge     String?
+
+  // 🆕 [PHASE B] Date d'expiration du challenge ci-dessus.
+  //
+  // Le problème corrigé : `currentChallenge` ne périmait JAMAIS. Il restait
+  // valide indéfiniment, jusqu'à ce qu'une nouvelle tentative de connexion
+  // l'écrase — parfois des semaines plus tard. Un attaquant obtenant une
+  // réponse signée pour ce challenge (via un log, un cache, ou en piégeant
+  // l'utilisateur) pouvait donc la REJOUER bien après coup pour se connecter.
+  //
+  // 💡 La norme WebAuthn recommande explicitement des challenges à durée de
+  // vie courte, précisément pour empêcher ce rejeu. On visera 2 minutes côté
+  // code : largement assez pour poser un doigt sur un capteur, assez court
+  // pour qu'une réponse interceptée soit inutilisable.
+  //
+  // Nullable : les comptes existants n'ont pas encore de date, et un challenge
+  // consommé est remis à null avec le champ ci-dessus.
+  challengeExpires     DateTime?
+
+  passkeys             Passkey[]
+  
+  // 📱 2FA TOTP
+  // ⚠️ totpSecret n'est plus stocké EN CLAIR (chiffré)
+  // backupCodes existe dans le schéma mais rien ne le génère actuellement côté API.
+  totpEnabled          Boolean               @default(false)
+  totpSecret           String?
+  backupCodes          String?
+  
+  // INVITATION SÉCURISÉE B2B
+  invitationToken      String?               @unique
+  invitationExpires    DateTime?
+
+  // 💡 NOUVEAU : Préférences de routage des e-mails (Settings)
+  emailNotifSuccess    Boolean               @default(false)
+  emailNotifAlerts     Boolean               @default(true)
+  emailNotifWeekly     Boolean               @default(false)
+
+  verificationRequests VerificationRequest[]
+  auditLogs            AuditLog[]            
+  userSessions         UserSession[] 
+
+  // Clés API générées par cet utilisateur        
+  createdApiKeys       ApiKey[]
+
+  // Notifications ciblées pour cet utilisateur
+  notifications        Notification[]
+
+  // 🆕 [PHASE B] Jetons de réinitialisation de mot de passe (voir modèle en bas)
+  passwordResetTokens  PasswordResetToken[]
+}
+
+// =====================================================================
+// 📁 MOTEUR KYC : DOSSIERS CLIENTS
+// =====================================================================
+model VerificationRequest {
+  id           String   @id @default(cuid())
+  customerName String
+
+  // 🆕 [ARABE] Nom tel qu'il figure SUR LA CARTE, en écriture arabe.
+  //
+  // ⚠️ LE PROBLÈME QUE ÇA RÉSOUT : les CIN tunisiennes portent le nom en
+  // arabe, alors que `customerName` ci-dessus est saisi en alphabet latin.
+  // La vérification OCR cherchait donc la chaîne "rayen" dans un texte arabe
+  // — elle ne pouvait JAMAIS la trouver. Résultat : `ocrNameMismatch` se
+  // déclenchait sur 100% des dossiers tunisiens, coûtant 40 points de
+  // pénalité à chaque client, tous parfaitement légitimes.
+  //
+  // 💡 POURQUOI DEUX CHAMPS ET NON UNE CONVERSION AUTOMATIQUE : il n'existe
+  // pas de translittération unique. "Mhalla" peut s'écrire محلة, المحلة ou
+  // محلا selon l'état civil. Et certaines mentions sont des conventions
+  // administratives, pas des translittérations : "dit" devient شهرة sur les
+  // CIN tunisiennes — aucun outil ne le devinerait. L'agent recopie ce qu'il
+  // voit, il n'y a donc rien à deviner.
+  //
+  // 💡 LES DEUX CHAMPS SERVENT À DES CHOSES DIFFÉRENTES :
+  //   • `customerName`   → screening OpenSanctions (les listes ONU/UE/US
+  //                        indexent les noms en alphabet latin), emails au
+  //                        client, affichage dans le dashboard
+  //   • `customerNameAr` → comparaison avec le texte OCR, uniquement
+  //
+  // ⚠️ NULLABLE, ET C'EST DÉLIBÉRÉ. Trois raisons :
+  //   1. Les dossiers existants n'en ont pas — les rendre invalides d'un coup
+  //      serait absurde.
+  //   2. Tous les postes n'ont pas de clavier arabe installé. Un agent qui ne
+  //      peut pas le saisir ne doit pas être bloqué.
+  //   3. Un client non tunisien (passeport français, par exemple) n'a aucun
+  //      nom arabe à saisir.
+  // Quand le champ est vide, le système retombe simplement sur la comparaison
+  // latine — le comportement actuel.
+  customerNameAr String?
+
+  email        String  
+  type         String   
+  status       String   @default("pending") // pending, verified, rejected
+  
+  cin          String   
+  documentType String   @default("CIN")
+  nationality  String?
+  dateOfBirth  String?
+  phoneNumber  String?
+
+  // ⚠️ ANCIEN STOCKAGE (uploadthing) — CONSERVÉ POUR LES DOSSIERS EXISTANTS
+  // Ces colonnes contiennent des URLs PUBLIQUES ET PERMANENTES : quiconque
+  // connaît le lien voit le document, sans compte ni session, et pour toujours.
+  // C'est précisément la faille qu'on corrige avec les deux champs ci-dessous.
+  //
+  // 💡 On ne les supprime PAS : les dossiers déjà créés n'ont que ces URLs, et
+  // les effacer les rendrait instantanément inconsultables.
+  idCardUrl    String?
+  selfieUrl    String?
+
+  // 🆕 [PHASE B] NOUVEAU STOCKAGE (Supabase Storage, bucket privé)
+  //
+  // Format : "{companyId}/{identifiant aléatoire}-{idcard|selfie}.{ext}"
+  // Exemple : "cmp_a1b2c3/9f8e7d6c5b4a3921-idcard.jpg"
+  //
+  // 💡 LA DIFFÉRENCE FONDAMENTALE AVEC LES COLONNES CI-DESSUS :
+  // une URL est directement adressable — la coller dans un navigateur affiche
+  // le fichier. Un CHEMIN ne l'est pas : c'est une simple coordonnée interne au
+  // bucket privé, sans nom de domaine, sans protocole, inutilisable telle
+  // quelle. Voir le document exige de demander au serveur une URL signée
+  // temporaire (lib/storage.ts), ce qu'il n'accorde qu'après avoir vérifié la
+  // session ET le companyId du demandeur.
+  idCardPath   String?
+  selfiePath   String?
+
+    // 🆕 [PHASE C — LIVENESS] LES TROIS IMAGES DE LA SÉQUENCE DE PRÉSENCE
+  //
+  // 💡 POURQUOI LES CONSERVER ALORS QUE LE VERDICT SUFFIRAIT À LA DÉCISION :
+  // parce qu'un verdict sans les pièces qui l'ont produit n'est pas auditable.
+  // Un compliance officer qui conteste un rejet — ou un régulateur qui contrôle
+  // un dossier accepté — doit pouvoir REGARDER ce sur quoi la machine s'est
+  // prononcée. C'est le même principe que la piste d'audit : on ne demande pas
+  // qu'on nous croie sur parole.
+  //
+  // ⚠️ `selfiePath` N'EST PAS REMPLACÉ, IL EST ALIMENTÉ PAR L'IMAGE NEUTRE.
+  // L'image de référence de la séquence EST un selfie — un visage de face, en
+  // pose neutre — à ceci près qu'elle est capturée en direct au lieu d'être
+  // uploadée. La comparaison faciale (pièce d'identité contre selfie) continue
+  // donc de fonctionner sans une ligne de changement, et sur une source
+  // strictement meilleure qu'avant.
+  livenessReferencePath String?
+  livenessAction1Path   String?
+  livenessAction2Path   String?
+
+  // Le verdict rendu par lib/liveness-verify.ts : "passed", "failed",
+  // "unavailable" — ou "skipped" quand l'agent a documenté un contournement.
+  //
+  // 💡 Stocké en clair plutôt que recalculable : le contrôle coûte un appel
+  // Gemini et dépend d'un jeton qui expire en 3 minutes. Il n'est PAS rejouable
+  // a posteriori. La seule trace possible est celle qu'on écrit au moment où il
+  // a lieu.
+  livenessVerdict String?
+
+  // 🆕 CONTOURNEMENT TRACÉ. Renseigné uniquement quand l'agent a créé le dossier
+  // sans capture caméra, en justifiant par écrit.
+  //
+  // ⚠️ CE CHAMP EST LA RAISON POUR LAQUELLE LE CONTOURNEMENT EST ACCEPTABLE.
+  // Sans lui, "pas de liveness" serait un état muet, indiscernable d'un oubli.
+  // Avec lui, chaque contournement porte un motif ET le nom de l'agent (via
+  // l'AuditLog du dossier). Un agent qui contourne dix fois par mois devient
+  // visible dans les journaux.
+  livenessSkipReason String?
+
+  // Nombre de séquences lancées avant d'aboutir.
+  //
+  // 💡 ON NE BLOQUE PAS SUR CE CHIFFRE, ON LE REND VISIBLE. Une personne réelle
+  // rate parfois une pose : deux ou trois essais sont normaux, les plafonner
+  // pénaliserait des clients légitimes. Dix essais sur un même dossier est un
+  // signal — un fraudeur qui relance jusqu'à tomber sur les deux actions qu'il
+  // sait imiter. Le compteur figure dans le rationale, à charge de l'agent qui
+  // relit de s'y intéresser.
+  livenessAttempts Int?
+
+  score        String?  
+  riskLevel    String?  
+  aiRationale  String?  
+
+  submittedAt  DateTime @default(now())
+  updatedAt    DateTime @updatedAt 
+
+  // 🏢 ISOLATION DES DONNÉES (Le dossier appartient à l'entreprise)
+  companyId    String?
+  company      Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // ⚖️ CONFORMITÉ LÉGALE (SetNull au lieu de Cascade)
+  userId       String?  
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  auditLogs    AuditLog[] 
+}
+
+// =====================================================================
+// 📜 PISTE D'AUDIT (OBLIGATOIRE EN COMPLIANCE)
+// =====================================================================
+model AuditLog {
+  id          String   @id @default(cuid())
+  action      String   
+  details     String?  
+  timestamp   DateTime @default(now())
+
+  // Centralisation B2B obligatoire
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  requestId   String?
+  request     VerificationRequest? @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  agentId     String?
+  agent       User?    @relation(fields: [agentId], references: [id], onDelete: SetNull)
+}
+
+// =====================================================================
+// 💻 SESSIONS DYNAMIQUES
+// =====================================================================
+model UserSession {
+  id           String   @id @default(cuid())
+  userAgent    String   
+  deviceType   String   
+  ipAddress    String   
+  isActive     Boolean  @default(true) 
+  createdAt    DateTime @default(now())
+  lastActiveAt DateTime @default(now()) @updatedAt
+
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// =====================================================================
+// 🔑 CRYPTOGRAPHIE : PASSKEYS
+// =====================================================================
+model Passkey {
+  id                  String   @id @default(cuid())
+  credentialID        String   @unique 
+  credentialPublicKey Bytes    
+  counter             Int      
+  transports          String?  
+  
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt           DateTime @default(now())
+  lastUsedAt          DateTime @default(now())
+}
+
+// =====================================================================
+// 📩 ONBOARDING SÉCURISÉ : VÉRIFICATION OTP (Phase 6)
+// =====================================================================
+model OtpCode {
+  id        String   @id @default(cuid())
+  // @unique sur l'email : un seul code actif par adresse à la fois — générer un
+  // nouveau code écrase (upsert) l'ancien plutôt que d'en accumuler plusieurs.
+  email     String   @unique
+  code      String   // Le code à 6 chiffres
+  expiresAt DateTime // Date d'expiration (ex: dans 10 minutes)
+  createdAt DateTime @default(now())
+
+  // 🆕 [PHASE B — item 4] Nombre de tentatives de vérification déjà consommées
+  // par CE code précis.
+  //
+  // ⚠️ POURQUOI CE CHAMP ALORS QU'UN RATE LIMITING EXISTE DÉJÀ (lib/ratelimit.ts) :
+  // les deux protections ne mesurent pas la même chose, et la première laisse un
+  // trou que la seconde ferme.
+  //   • Le rate limiting compte les requêtes d'un ÉMETTEUR (une IP, une adresse
+  //     email) sur une fenêtre de temps glissante. Passé cette fenêtre, son
+  //     compteur repart de zéro.
+  //   • Ce champ-ci compte les tentatives contre un SECRET. Il ne se réinitialise
+  //     jamais tout seul.
+  //
+  // Le scénario concret que ça bloque : le code est valable 10 minutes, la
+  // fenêtre de rate limiting par email est de 15 minutes pour 10 tentatives.
+  // Un attaquant épuise ses 10 essais, prend un 429... mais le code, lui, est
+  // TOUJOURS vivant pendant les minutes restantes, et son compteur de rate
+  // limiting redeviendra disponible. En multipliant les IP il enchaîne les
+  // salves. Avec ce champ, le code lui-même meurt au 5e échec : peu importe
+  // combien d'IP, de proxies ou de patience l'attaquant a, il n'y a plus rien
+  // à deviner. Il doit repasser par /api/register, lui-même plafonné à 3 envois
+  // par heure — ce qui ramène le débit d'attaque à 15 essais par heure, contre
+  // 1 000 000 de combinaisons possibles.
+  //
+  // 💡 POURQUOI EN BASE ET PAS DANS REDIS : le compteur doit vivre et mourir
+  // EXACTEMENT avec le code qu'il protège. Le stocker sur la même ligne garantit
+  // qu'un nouveau code repart à zéro et qu'un code consommé emporte son compteur
+  // avec lui, sans aucune synchronisation à écrire. Dans Redis, les deux durées
+  // de vie seraient indépendantes — donc désynchronisables.
+  //
+  // 💡 POURQUOI PAS DE `lockedUntil` : le blocage n'a pas besoin d'être temporaire.
+  // Au 5e échec, on SUPPRIME le code. Un verrou à durée déterminée laisserait le
+  // secret en vie pendant le blocage, ce qui est précisément ce qu'on cherche à
+  // éviter — et obligerait à gérer une date de plus.
+  attempts  Int      @default(0)
+}
+
+// =====================================================================
+// 🆕 [PHASE B] 🔓 RÉINITIALISATION DE MOT DE PASSE ("Forgot password")
+// =====================================================================
+// Pourquoi ce modèle existe : sans lui, un utilisateur qui oublie son mot de
+// passe est DÉFINITIVEMENT verrouillé dehors — la seule issue serait une
+// intervention manuelle en base. Le lien "Forgot password?" de la page de
+// login menait d'ailleurs à une 404, faute de page ET de modèle de données.
+//
+// ⚠️ POURQUOI ON STOCKE UN HASH ET PAS LE JETON LUI-MÊME (`tokenHash`) :
+// le jeton envoyé par email est équivalent à un mot de passe temporaire —
+// quiconque le possède peut changer le mot de passe du compte. Si on le
+// stockait en clair, une fuite de la base permettrait de réinitialiser
+// n'importe quel compte ayant une demande en cours. On applique donc le même
+// principe que pour `User.password` : on ne garde qu'une empreinte, et on
+// compare les empreintes.
+//
+// 💡 POURQUOI SHA-256 ET PAS BCRYPT (contrairement aux mots de passe) :
+// deux raisons, et la seconde est décisive.
+//   1. bcrypt est VOLONTAIREMENT lent pour rendre coûteux le cassage de mots
+//      de passe humains, souvent faibles et devinables. Un jeton généré par
+//      crypto.randomBytes(32) contient 256 bits d'aléa : il est de toute façon
+//      impossible à deviner, la lenteur n'apporte donc rien.
+//   2. bcrypt utilise un "sel" aléatoire différent à chaque hachage : le même
+//      jeton produit donc un hash différent à chaque fois. Impossible de faire
+//      un `findUnique({ where: { tokenHash } })` — il faudrait charger TOUS les
+//      jetons de la base et les comparer un par un. SHA-256 est déterministe :
+//      un jeton donné produit toujours la même empreinte, la recherche directe
+//      par index devient donc possible.
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+
+  // Empreinte SHA-256 du jeton envoyé par email. @unique sert à deux choses :
+  // garantir qu'aucune collision n'est possible, et créer automatiquement
+  // l'index qui rend la recherche instantanée.
+  tokenHash String   @unique
+
+  // À qui appartient cette demande. Cascade : si le compte est supprimé, les
+  // jetons en attente n'ont plus aucun sens et doivent disparaître avec lui.
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Fenêtre de validité volontairement courte (on visera 30 minutes côté code).
+  // Plus la fenêtre est longue, plus longtemps un email intercepté reste
+  // exploitable par un attaquant.
+  expiresAt DateTime
+
+  // 🔒 USAGE UNIQUE. On marque la date d'utilisation au lieu de supprimer la
+  // ligne : ça permet de DÉTECTER une tentative de réutilisation (quelqu'un
+  // qui rejoue un lien déjà consommé est un signal suspect, potentiellement un
+  // email compromis), là où une suppression pure renverrait le même message
+  // qu'un jeton simplement inexistant.
+  // ⚠️ Contrepartie : les lignes s'accumulent. Une purge périodique des jetons
+  // expirés/utilisés devra être ajoutée au cron hebdomadaire existant.
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Index explicite sur userId : nécessaire pour l'opération "invalider toutes
+  // les demandes en cours de cet utilisateur", qu'on déclenchera à chaque
+  // nouvelle demande (une seule réinitialisation active à la fois) et après un
+  // changement de mot de passe réussi.
+  @@index([userId])
+}
+
+// =====================================================================
+// 🔌 ÉCOSYSTÈME B2B : API KEYS (Phase 9)
+// =====================================================================
+model ApiKey {
+  id          String   @id @default(cuid())
+  name        String   // Ex: "Serveur de Production NodeJS"
+  // ⚠️ Clé stockée EN CLAIR (ex: tv_live_xxx). Idéalement on stockerait un hash
+  // SHA-256 + un préfixe affichable, pour qu'une fuite de DB ne compromette pas
+  // les clés API des clients (voir roadmap Phase D).
+  key         String   @unique
+  lastUsedAt  DateTime? // Pour savoir si elle est active
+  createdAt   DateTime @default(now())
+
+  // Apparentée à l'entreprise
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // Créée par un admin
+  createdBy   String
+  user        User     @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+}
+
+// =====================================================================
+// 🔔 MOTEUR DE NOTIFICATIONS (Phase 11)
+// =====================================================================
+model Notification {
+  id          String   @id @default(cuid())
+  type        String   // Ex: "HIGH_RISK_ALERT", "SYSTEM", "SUCCESS", "BILLING"
+  title       String
+  message     String
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  // La notification appartient au Workspace (Entreprise)
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // Optionnel : Lié à un utilisateur spécifique
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
