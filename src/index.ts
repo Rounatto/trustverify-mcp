@@ -1,83 +1,133 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { findCustomerInput, findCustomer } from "./tools/find-customer.js";
+import { countByStatusInput, countByStatus } from "./tools/count-by-status.js";
+import { listRecentInput, listRecent } from "./tools/list-recent.js";
+import { verifierQuota } from "./guard.js";
 
-// ============================================================================
-// 1. LE SERVEUR
-// ============================================================================
-// `name` et `version` sont échangés pendant le handshake initial, avant tout
-// appel d'outil. C'est la carte de visite : le host les affiche dans son
-// interface pour que l'utilisateur sache à quoi il est connecté.
 const server = new McpServer({
   name: "trustverify",
-  version: "0.1.0",
+  version: "0.3.0",
 });
 
 // ============================================================================
-// 2. LA DÉCLARATION DE L'OUTIL — C'EST ICI L'ÉTAPE 2 DU CYCLE
+// OUTIL 1 : RECHERCHE PAR NOM
 // ============================================================================
-// Quand le host demandera "tools/list", c'est exactement ce bloc qui sera
-// sérialisé et envoyé au modèle.
-//
-// ⚠️ LA DESCRIPTION EST UN PROMPT. Ce n'est pas de la documentation pour un
-// humain. C'est la SEULE chose que le modèle lit pour décider s'il appelle cet
-// outil. Il ne voit ni ton code, ni ton schéma Prisma, ni ta base.
 server.registerTool(
   "find_customer",
   {
-    // Titre lisible, affiché dans la popup d'autorisation du host.
     title: "Rechercher un client KYC",
-
     description: [
-      // Phrase 1 — CE QUE ÇA FAIT. Le modèle fait un appariement sémantique
-      // entre la question de l'utilisateur et cette phrase.
       "Recherche des dossiers de vérification KYC par nom de client.",
 
-      // Phrase 2 — QUAND L'UTILISER. Sans ça, le modèle hésite ou répond de
-      // mémoire. On lui donne les questions déclencheuses.
-      "Utilise cet outil pour savoir si une personne a déjà un dossier chez ce client, " +
-      "ou pour connaître son statut de vérification, son niveau de risque et sa date de soumission.",
+      "Utilise cet outil UNIQUEMENT quand tu connais le nom de la personne recherchée.",
 
-      // Phrase 3 — CE QUE ÇA RENVOIE. Évite que le modèle promette à
-      // l'utilisateur des informations que l'outil ne fournit pas.
       "Retourne pour chaque dossier : identifiant, nom, statut (pending, verified, rejected), " +
-      "score, niveau de risque, type de document et date de soumission.",
+      "score de risque, niveau de risque, type de document et date de soumission. " +
+      // ⚠️ L'ÉCHELLE DU SCORE, EXPLICITÉE.
+      // Sans cette phrase, le modèle voit "score 100 | risque High | rejected"
+      // et ne peut pas trancher : 100 = excellent, ou 100 = risque maximal ?
+      // Un champ dont l'échelle n'est pas évidente doit être expliqué dans la
+      // description, ou ne pas être renvoyé du tout.
+      "Le score est un SCORE DE RISQUE : plus il est élevé, plus le dossier est risqué. " +
+      "Un score proche de 100 signale un risque maximal, un score proche de 0 un dossier sain.",
 
-      // Phrase 4 — LES LIMITES. Empêche le modèle d'affirmer un total faux.
-      "Maximum 10 résultats, triés du plus récent au plus ancien. " +
-      "Ne retourne que les dossiers de l'entreprise connectée.",
+      "Affiche au maximum 10 dossiers, les plus récents d'abord, mais indique toujours " +
+      "le nombre total de correspondances. Ne retourne que les dossiers de l'entreprise connectée.",
 
-      // Phrase 5 — CE QUE ÇA NE FAIT PAS. Le modèle apprend à ne pas espérer
-      // obtenir des documents par cet outil, donc à ne pas boucler dessus.
       "Ne donne accès ni aux documents d'identité, ni au numéro de CIN, ni aux coordonnées du client.",
-    ].join(" "),
 
-    // Le schéma Zod, converti automatiquement en JSON Schema par le SDK.
+      // ⚠️ LES PHRASES ANTI-ÉNUMÉRATION.
+      "N'utilise JAMAIS cet outil pour explorer la base ou reconstituer une liste. " +
+      "Ne lance JAMAIS plusieurs recherches sur des fragments de lettres. " +
+      "Pour lister des dossiers, utilise list_recent_verifications. " +
+      "Pour compter, utilise count_verifications_by_status.",
+    ].join(" "),
     inputSchema: findCustomerInput,
   },
-
-  // ============================================================================
-  // 3. LE HANDLER — C'EST ICI L'ÉTAPE 5 DU CYCLE
-  // ============================================================================
-  // Cette fonction ne s'exécute QUE quand le host décide d'exécuter l'appel,
-  // après validation Zod et après autorisation de l'utilisateur.
   async ({ name }) => {
-    const texte = await findCustomer({ name });
+    // 🔒 Le quota est vérifié AVANT toute requête à la base.
+    const bloque = verifierQuota("find_customer");
+    if (bloque) return { content: [{ type: "text", text: bloque }] };
 
-    // Format imposé par le protocole : une liste de blocs de contenu.
-    return {
-      content: [{ type: "text", text: texte }],
-    };
+    const texte = await findCustomer({ name });
+    return { content: [{ type: "text", text: texte }] };
   }
 );
 
 // ============================================================================
-// 4. LE BRANCHEMENT DU TRANSPORT
+// OUTIL 2 : COMPTAGE PAR STATUT
 // ============================================================================
-// StdioServerTransport branche le serveur sur stdin/stdout. À partir de cet
-// instant, la sortie standard appartient au protocole.
+server.registerTool(
+  "count_verifications_by_status",
+  {
+    title: "Compter les dossiers par statut",
+    description: [
+      "Compte les dossiers de vérification KYC de l'entreprise, regroupés par statut.",
+
+      "Utilise cet outil pour toute question de VOLUME : combien de dossiers sont en attente, " +
+      "combien ont été vérifiés, combien rejetés, ou combien de dossiers l'entreprise possède au total.",
+
+      "Retourne le nombre de dossiers pour chaque statut ainsi que le total. " +
+      "Un statut absent de la réponse signifie qu'aucun dossier ne le porte actuellement.",
+
+      "N'utilise JAMAIS find_customer pour compter des dossiers : cet outil-ci donne le chiffre exact, " +
+      "alors que find_customer est plafonné à 10 résultats et ne renvoie que des correspondances de nom.",
+
+      "Ne retourne aucun nom de client ni aucune donnée personnelle, uniquement des compteurs.",
+    ].join(" "),
+    inputSchema: countByStatusInput,
+  },
+  async () => {
+    const bloque = verifierQuota("count_verifications_by_status");
+    if (bloque) return { content: [{ type: "text", text: bloque }] };
+
+    const texte = await countByStatus();
+    return { content: [{ type: "text", text: texte }] };
+  }
+);
+
+// ============================================================================
+// OUTIL 3 : LISTER LES DOSSIERS RÉCENTS
+// ============================================================================
+server.registerTool(
+  "list_recent_verifications",
+  {
+    title: "Lister les dossiers récents",
+    description: [
+      "Liste les dossiers de vérification KYC les plus récents de l'entreprise, " +
+      "sans avoir besoin de connaître un nom.",
+
+      // ⚠️ LA PHRASE LA PLUS IMPORTANTE DE CETTE DESCRIPTION.
+      // C'est elle qui ferme le trou qui a provoqué l'énumération.
+      "Utilise cet outil pour toute demande de vue d'ensemble : 'fais-moi un point sur nos dossiers', " +
+      "'montre-moi les derniers dossiers', 'quels dossiers demandent une action', " +
+      "'quels sont les dossiers les plus risqués'.",
+
+      "Deux filtres optionnels : status (pending, verified, rejected) et riskLevel (Low, Medium, High). " +
+      "Sans filtre, retourne les plus récents tous statuts confondus. " +
+      "Avec status='pending', ne retourne que les dossiers en attente de décision. " +
+      "Avec riskLevel='High', ne retourne que les dossiers les plus risqués.",
+
+      "Affiche au maximum 15 dossiers, du plus récent au plus ancien, et indique toujours " +
+      "le nombre total correspondant au filtre.",
+
+      "Le score est un SCORE DE RISQUE : plus il est élevé, plus le dossier est risqué.",
+
+      "Ne donne accès ni aux documents d'identité, ni au numéro de CIN, ni aux coordonnées du client.",
+    ].join(" "),
+    inputSchema: listRecentInput,
+  },
+  async ({ status, riskLevel }) => {
+    const bloque = verifierQuota("list_recent_verifications");
+    if (bloque) return { content: [{ type: "text", text: bloque }] };
+
+    const texte = await listRecent({ status, riskLevel });
+    return { content: [{ type: "text", text: texte }] };
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-// Sur stderr : invisible du protocole, visible dans les logs du host.
-console.error("[trustverify-mcp] serveur démarré, 1 outil exposé");
+console.error("[trustverify-mcp] serveur démarré, 3 outils exposés");
